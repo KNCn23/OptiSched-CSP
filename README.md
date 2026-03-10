@@ -60,4 +60,3 @@
 
 ---
 
-Developed with ⚡️ by KNCnV2 (Kaan Can Olcay).
