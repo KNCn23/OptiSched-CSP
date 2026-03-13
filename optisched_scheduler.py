@@ -1,150 +1,171 @@
-import json
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Tuple
 import pandas as pd
 from ortools.sat.python import cp_model
-from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
+
+@dataclass
+class SchedulerConfig:
+    classrooms: List[str] = field(default_factory=lambda: [f'D{i}' for i in range(20)])
+    days: List[int] = field(default_factory=lambda: list(range(5)))
+    day_map: Dict[int, str] = field(default_factory=lambda: {0: 'Pazartesi', 1: 'Salı', 2: 'Çarşamba', 3: 'Perşembe', 4: 'Cuma'})
+    timeslots: List[int] = field(default_factory=lambda: list(range(8)))
+    time_map: Dict[int, str] = field(default_factory=lambda: {0: '09:00', 1: '10:00', 2: '11:00', 3: '12:00', 4: '13:00', 5: '14:00', 6: '15:00', 7: '16:00'})
+    max_solve_time_seconds: float = 60.0
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class DataLoader:
+    @staticmethod
+    def load_data(excel_file: str) -> pd.DataFrame:
+        df = pd.read_excel(excel_file)
+        expanded = []
+        for i, row in df.iterrows():
+            t_h = int(row['t_hour']) if pd.notna(row['t_hour']) else 0
+            l_h = int(row['l_hour']) if pd.notna(row['l_hour']) else 0
+            if t_h > 0:
+                expanded.append({
+                    'parent_id': i, 
+                    'name': f"{row['name']} (T)", 
+                    'code': row['code'] if 'code' in row else str(row['name']).split(' ')[0] + ' (T)',
+                    'hours': t_h, 
+                    'type': 'Teorik', 
+                    'dept_id': row['dept_id'], 
+                    'program_semester': row['program_semester'], 
+                    'instructor': row['instructor']
+                })
+            if l_h > 0:
+                expanded.append({
+                    'parent_id': i, 
+                    'name': f"{row['name']} (L)", 
+                    'code': row['code'] if 'code' in row else str(row['name']).split(' ')[0] + ' (L)',
+                    'hours': l_h, 
+                    'type': 'Lab', 
+                    'dept_id': row['dept_id'], 
+                    'program_semester': row['program_semester'], 
+                    'instructor': row['instructor']
+                })
+        return pd.DataFrame(expanded)
 
 class OptiSchedSolver:
-    def __init__(self, data_file):
-        self.data = self._load_data(data_file)
+    def __init__(self, df: pd.DataFrame, config: SchedulerConfig):
+        self.df = df
+        self.config = config
         self.model = cp_model.CpModel()
         self.assignments = {}
         self.result_data = []
 
-    def _load_data(self, data_file):
-        with open(data_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+    def build_model(self) -> None:
+        self.start_vars = {}
+        # 1. Variables
+        for idx, row in self.df.iterrows():
+            H = int(row['hours'])
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    for r in self.config.classrooms:
+                        self.assignments[(idx, d, s, r)] = self.model.NewBoolVar(f"c{idx}_d{d}_s{s}_r{r}")
+                        if s + H <= len(self.config.timeslots):
+                            self.start_vars[(idx, d, s, r)] = self.model.NewBoolVar(f"start_c{idx}_d{d}_s{s}_r{r}")
 
-    def build_model(self):
-        courses = self.data['courses']
-        classrooms = self.data['classrooms']
-        days = self.data['days']
-        timeslots = self.data['timeslots']
-        lecturers = {l['id']: l['name'] for l in self.data['lecturers']}
+        # 2. Total hours AND block continuity (Same day, consecutive hours, same room)
+        for idx, row in self.df.iterrows():
+            H = int(row['hours'])
+            valid_starts = []
+            
+            self.model.Add(sum(self.assignments[(idx, d, s, r)] for d in self.config.days for s in self.config.timeslots for r in self.config.classrooms) == H)
 
-        for course in courses:
-            for d_idx in range(len(days)):
-                for slot in timeslots:
-                    for room in classrooms:
-                        self.assignments[(course['id'], d_idx, slot['id'], room['id'])] = self.model.NewBoolVar(
-                            f'c{course["id"]}_d{d_idx}_s{slot["id"]}_r{room["id"]}'
-                        )
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    if s + H <= len(self.config.timeslots):
+                        for r in self.config.classrooms:
+                            s_var = self.start_vars[(idx, d, s, r)]
+                            valid_starts.append(s_var)
+                            for k in range(H):
+                                self.model.AddImplication(s_var, self.assignments[(idx, d, s + k, r)])
 
-        # Constraints
-        for course in courses:
-            self.model.Add(sum(self.assignments[(course['id'], d_idx, slot['id'], room['id'])]
-                               for d_idx in range(len(days)) for slot in timeslots for room in classrooms) == course['hours_per_week'])
+            self.model.AddExactlyOne(valid_starts)
 
-        for d_idx in range(len(days)):
-            for slot in timeslots:
-                for room in classrooms:
-                    self.model.Add(sum(self.assignments[(course['id'], d_idx, slot['id'], room['id'])] for course in courses) <= 1)
+        # 3. Lab/Theory Separation: Different Day
+        for parent_id in self.df['parent_id'].unique():
+            group = self.df[self.df['parent_id'] == parent_id]
+            if len(group) == 2:
+                t_idx = group[group['type'] == 'Teorik'].index[0]
+                l_idx = group[group['type'] == 'Lab'].index[0]
+                
+                for d in self.config.days:
+                    t_day_active = self.model.NewBoolVar(f"t_day_{t_idx}_{d}")
+                    self.model.Add(sum(self.assignments[(t_idx, d, s, r)] for s in self.config.timeslots for r in self.config.classrooms) > 0).OnlyEnforceIf(t_day_active)
+                    self.model.Add(sum(self.assignments[(t_idx, d, s, r)] for s in self.config.timeslots for r in self.config.classrooms) == 0).OnlyEnforceIf(t_day_active.Not())
+                    
+                    l_day_active = self.model.NewBoolVar(f"l_day_{l_idx}_{d}")
+                    self.model.Add(sum(self.assignments[(l_idx, d, s, r)] for s in self.config.timeslots for r in self.config.classrooms) > 0).OnlyEnforceIf(l_day_active)
+                    self.model.Add(sum(self.assignments[(l_idx, d, s, r)] for s in self.config.timeslots for r in self.config.classrooms) == 0).OnlyEnforceIf(l_day_active.Not())
+                    
+                    self.model.Add(t_day_active + l_day_active <= 1)
 
-        for d_idx in range(len(days)):
-            for slot in timeslots:
-                for l_id in lecturers:
-                    l_courses = [c['id'] for c in courses if c['lecturer_id'] == l_id]
-                    if l_courses:
-                        self.model.Add(sum(self.assignments[(c_id, d_idx, slot['id'], room['id'])] for c_id in l_courses for room in classrooms) <= 1)
-
-        for d_idx in range(len(days)):
-            for slot in timeslots:
-                if slot.get('is_lunch'):
-                    for course in courses:
-                        for room in classrooms:
-                            self.model.Add(self.assignments[(course['id'], d_idx, slot['id'], room['id'])] == 0)
-
-        for course in courses:
-            for room in classrooms:
-                if course['student_count'] > room['capacity']:
-                    for d_idx in range(len(days)):
-                        for slot in timeslots:
-                            self.model.Add(self.assignments[(course['id'], d_idx, slot['id'], room['id'])] == 0)
-
-    def solve(self, output_excel='ders_programi.xlsx'):
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 30.0
-        status = solver.Solve(self.model)
+        # 4. Global Conflicts (Dept/Semester/Instructor/Room)
+        for (dept, sem), group in self.df.groupby(['dept_id', 'program_semester']):
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    self.model.Add(sum(self.assignments[(idx, d, s, r)] for idx in group.index for r in self.config.classrooms) <= 1)
         
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            self._collect_results(solver)
-            self._export_to_excel(output_excel)
+        for instructor in self.df['instructor'].unique():
+            if str(instructor) == '-': continue
+            inst_group = self.df[self.df['instructor'] == instructor]
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    self.model.Add(sum(self.assignments[(idx, d, s, r)] for idx in inst_group.index for r in self.config.classrooms) <= 1)
+
+        for r in self.config.classrooms:
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    self.model.Add(sum(self.assignments[(idx, d, s, r)] for idx in self.df.index) <= 1)
+
+    def solve(self, output_excel: str = 'ders_programi_final_v7.xlsx') -> None:
+        solver = cp_model.CpSolver()
+        if solver.Solve(self.model) in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            for idx, row in self.df.iterrows():
+                for d in self.config.days:
+                    for s in self.config.timeslots:
+                        for r in self.config.classrooms:
+                            if solver.Value(self.assignments[(idx, d, s, r)]):
+                                self.result_data.append({
+                                    "Gün": self.config.day_map[d], 
+                                    "Saat": self.config.time_map[s], 
+                                    "Sınıf": r, 
+                                    "Ders": row['name'], 
+                                    "DersKodu": row['code'],
+                                    "Hoca": row['instructor']
+                                })
+            df_res = pd.DataFrame(self.result_data)
+            
+            # Create a pivot table for the visual timetable
+            pivot_df = df_res.pivot_table(
+                index=['Gün', 'Saat'],
+                columns='Sınıf',
+                values='DersKodu',
+                aggfunc=lambda x: '\n'.join(x)
+            ).fillna('')
+            
+            # Enforce sequential order for Days and Times in the Pivot Table
+            gün_sirasi = [self.config.day_map[d] for d in self.config.days]
+            saat_sirasi = [self.config.time_map[s] for s in self.config.timeslots]
+            all_idx = pd.MultiIndex.from_product([gün_sirasi, saat_sirasi], names=['Gün', 'Saat'])
+            pivot_df = pivot_df.reindex(all_idx).fillna('')
+            
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                df_res.to_excel(writer, sheet_name='Tum_Okul_Liste', index=False)
+                pivot_df.to_excel(writer, sheet_name='Gorsel_Program')
+                
+            print(f"✅ Çizelge hazır: {output_excel}")
         else:
             print("❌ Çözüm bulunamadı!")
 
-    def _collect_results(self, solver):
-        days = self.data['days']
-        timeslots = self.data['timeslots']
-        classrooms = self.data['classrooms']
-        courses = self.data['courses']
-        lecturers = {l['id']: l['name'] for l in self.data['lecturers']}
-
-        for d_idx, day in enumerate(days):
-            for slot in timeslots:
-                for room in classrooms:
-                    for course in courses:
-                        if solver.Value(self.assignments[(course['id'], d_idx, slot['id'], room['id'])]):
-                            self.result_data.append({
-                                "Gün": day,
-                                "Saat": slot['time'],
-                                "Sınıf": room['id'],
-                                "Bilgi": f"{course['name']}\n{lecturers[course['lecturer_id']]}"
-                            })
-                if slot.get('is_lunch'):
-                    self.result_data.append({"Gün": day, "Saat": slot['time'], "Sınıf": "LUNCH", "Bilgi": "--- ÖĞLE ARASI ---"})
-
-    def _export_to_excel(self, filename):
-        df = pd.DataFrame(self.result_data)
-        days_order = self.data['days']
-        slots_order = [s['time'] for s in self.data['timeslots']]
-
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            for room in self.data['classrooms']:
-                room_df = df[(df['Sınıf'] == room['id']) | (df['Sınıf'] == "LUNCH")]
-                if not room_df.empty:
-                    pivot = room_df.pivot_table(index='Saat', columns='Gün', values='Bilgi', aggfunc='first')
-                    pivot = pivot.reindex(columns=days_order, index=slots_order)
-                    sheet_name = f'Sınıf {room["id"]}'
-                    pivot.to_excel(writer, sheet_name=sheet_name)
-                    
-                    # STYLING
-                    ws = writer.sheets[sheet_name]
-                    self._apply_styles(ws)
-
-            # TÜM OKUL ÖZET
-            all_pivot = df.pivot_table(index=['Saat', 'Sınıf'], columns='Gün', values='Bilgi', aggfunc='first').reindex(columns=days_order)
-            all_pivot.to_excel(writer, sheet_name='Tüm Okul Özet')
-            self._apply_styles(writer.sheets['Tüm Okul Özet'])
-
-        print(f"✅ Görsel ve Kutucuklu Excel Hazır: {filename}")
-
-    def _apply_styles(self, ws):
-        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-        header_fill = PatternFill(start_color="D7E4BC", end_color="D7E4BC", fill_type="solid")
-        lunch_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-        
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                cell.border = thin_border
-                
-                # Header Styling
-                if cell.row == 1 or cell.column == 1:
-                    cell.font = Font(bold=True)
-                    cell.fill = header_fill
-                
-                # Lunch Break Styling
-                if cell.value == "--- ÖĞLE ARASI ---":
-                    cell.fill = lunch_fill
-                    cell.font = Font(italic=True, color="808080")
-
-        # Column Widths
-        for col in ws.columns:
-            ws.column_dimensions[col[0].column_letter].width = 20
-        # Row Heights
-        for row_dim in ws.row_dimensions.values():
-            row_dim.height = 45
-
 if __name__ == '__main__':
-    scheduler = OptiSchedSolver('optisched_data.json')
+    conf = SchedulerConfig()
+    loader = DataLoader()
+    course_df = loader.load_data('2.xls')
+    scheduler = OptiSchedSolver(course_df, conf)
     scheduler.build_model()
     scheduler.solve()
