@@ -1,79 +1,40 @@
-"""
-OptiSched Scheduler - Academic Course Scheduling Engine
-
-This module implements a Constraint Satisfaction Problem (CSP) solver
-using Google OR-Tools to schedule university courses with block requirements
-and non-overlapping constraints for students and instructors.
-"""
-
 import logging
 import sys
 import random
-import argparse
-from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
-
+from typing import Dict, List, Any, Tuple
 import pandas as pd
 from ortools.sat.python import cp_model
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
 @dataclass
 class SchedulerConfig:
-    """Configuration class for the Scheduler environment."""
     days: List[int] = field(default_factory=lambda: list(range(5)))
-    day_map: Dict[int, str] = field(default_factory=lambda: {
-        0: 'Pazartesi', 1: 'Salı', 2: 'Çarşamba', 3: 'Perşembe', 4: 'Cuma'
-    })
+    day_map: Dict[int, str] = field(default_factory=lambda: {0: 'Pazartesi', 1: 'Salı', 2: 'Çarşamba', 3: 'Perşembe', 4: 'Cuma'})
     timeslots: List[int] = field(default_factory=lambda: list(range(8)))
     time_map: Dict[int, str] = field(default_factory=lambda: {
-        0: '09:00', 1: '10:00', 2: '11:00', 3: '12:00', 4: '13:00', 
-        5: '14:00', 6: '15:00', 7: '16:00'
+        0: '09:00-10:00', 1: '10:00-11:00', 2: '11:00-12:00', 3: '12:00-13:00', 
+        4: '13:00-14:00', 5: '14:00-15:00', 6: '15:00-16:00', 7: '16:00-17:00'
     })
     max_solve_time_seconds: float = 60.0
-    random_seed: int = field(default_factory=lambda: random.randint(1, 100000))
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class DataLoader:
-    """Handles loading and preprocessing of course data from Excel."""
-
     @staticmethod
-    def load_data(excel_file_path: Path) -> pd.DataFrame:
-        """
-        Loads and expands course data from an Excel file, splitting multi-hour 
-        courses into predefined blocks (e.g., a 5-hour course becomes 3+2).
-        
-        Args:
-            excel_file_path (Path): Path to the input Excel spreadsheet.
-            
-        Returns:
-            pd.DataFrame: Expanded dataframe containing individual schedulable parts.
-        """
-        logger.info("Loading data from %s...", excel_file_path)
-        try:
-            df = pd.read_excel(excel_file_path)
-        except Exception as e:
-            logger.error("Failed to read excel file: %s", e)
-            raise
-
-        expanded_data: List[Dict[str, Any]] = []
-        for index, row in df.iterrows():
-            total_hours = int(row.get('hour', 0)) if pd.notna(row.get('hour')) else 0
+    def load_data(excel_file: str) -> pd.DataFrame:
+        df = pd.read_excel(excel_file)
+        expanded = []
+        for i, row in df.iterrows():
+            total_hours = int(row['hour']) if pd.notna(row['hour']) else 0
             if total_hours <= 0:
                 continue
                 
-            num_sections = int(row.get('seciton', 1)) if 'seciton' in row and pd.notna(row['seciton']) else 1
+            num_sections = int(row['seciton']) if 'seciton' in row and pd.notna(row['seciton']) else 1
             if num_sections <= 0:
                 num_sections = 1
                 
-            # Block splitting rules
+            splits = []
             if total_hours == 5:
                 splits = [3, 2]
             elif total_hours == 4:
@@ -84,82 +45,59 @@ class DataLoader:
                 splits = [total_hours]
                 
             for sec_idx in range(1, num_sections + 1):
-                for split_idx, split_hours in enumerate(splits):
+                for split_idx, h in enumerate(splits):
                     part_suffix = f" (P{split_idx+1})" if len(splits) > 1 else ""
-                    parent_id = f"{index}_{sec_idx}"
-                    code_val = f"{str(row.get('code', 'UNK'))}-{sec_idx}"
+                    parent_id = f"{i}_{sec_idx}"
                     
-                    expanded_data.append({
+                    code_val = f"{str(row['code'])}-{sec_idx}"
+                    
+                    expanded.append({
                         'parent_id': parent_id,
-                        'name': f"{row.get('name', 'Bilinmeyen Ders')}-{sec_idx}{part_suffix}",
+                        'name': f"{row['name']}-{sec_idx}{part_suffix}",
                         'code': code_val,
-                        'hours': split_hours,
-                        'semester': int(row.get('semester', 0)) if pd.notna(row.get('semester')) else 0,
+                        'hours': h,
+                        'semester': int(row['semester']) if pd.notna(row['semester']) else 0,
                         'section': sec_idx,
                         'total_sections': num_sections,
-                        'instructor': row.get('lecturer', 'Anonim')
+                        'instructor': row['lecturer']
                     })
                 
-        logger.info("Successfully expanded %d source courses to %d schedulable parts.", len(df), len(expanded_data))
-        return pd.DataFrame(expanded_data)
-
+        return pd.DataFrame(expanded)
 
 class OptiSchedSolver:
-    """Main scheduling engine utilizing Google OR-Tools CP-SAT."""
-    
-    def __init__(self, course_df: pd.DataFrame, config: SchedulerConfig):
-        """
-        Initialize the scheduler solver.
-        
-        Args:
-            course_df (pd.DataFrame): The preprocessed course data.
-            config (SchedulerConfig): Scheduling configuration and metadata.
-        """
-        self.df = course_df
+    def __init__(self, df: pd.DataFrame, config: SchedulerConfig):
+        self.df = df
         self.config = config
         self.model = cp_model.CpModel()
-        self.assignments: Dict[tuple, Any] = {}
-        self.start_vars: Dict[tuple, Any] = {}
-        self.result_data: List[Dict[str, Any]] = []
+        self.assignments = {}
+        self.result_data = []
 
     def build_model(self) -> None:
-        """Constructs the constraint programming model variables and constraints."""
-        logger.info("Building the CP-SAT model variables and constraints...")
-        
-        # 1. Variables Creation
+        self.start_vars = {}
+        # 1. Variables
         for idx, row in self.df.iterrows():
-            hours_needed = int(row['hours'])
-            for day in self.config.days:
-                for slot in self.config.timeslots:
-                    # Boolean variable: True if course `idx` is active on `day` at `slot`
-                    self.assignments[(idx, day, slot)] = self.model.NewBoolVar(f"c{idx}_d{day}_s{slot}")
-                    # Start variable to enforce block continuity
-                    if slot + hours_needed <= len(self.config.timeslots):
-                        self.start_vars[(idx, day, slot)] = self.model.NewBoolVar(f"start_c{idx}_d{day}_s{slot}")
+            H = int(row['hours'])
+            for d in self.config.days:
+                for s in self.config.timeslots:
+                    self.assignments[(idx, d, s)] = self.model.NewBoolVar(f"c{idx}_d{d}_s{s}")
+                    if s + H <= len(self.config.timeslots):
+                        self.start_vars[(idx, d, s)] = self.model.NewBoolVar(f"start_c{idx}_d{d}_s{s}")
 
         # 2. Total hours AND block continuity (Same day, consecutive hours)
         for idx, row in self.df.iterrows():
-            hours_needed = int(row['hours'])
+            H = int(row['hours'])
             valid_starts = []
             
-            # Constraint: Total hours mapped across all timeslots must equal required hours
-            self.model.Add(sum(
-                self.assignments[(idx, d, s)] 
-                for d in self.config.days 
-                for s in self.config.timeslots
-            ) == hours_needed)
+            self.model.Add(sum(self.assignments[(idx, d, s)] for d in self.config.days for s in self.config.timeslots) == H)
 
             for d in self.config.days:
                 for s in self.config.timeslots:
-                    if s + hours_needed <= len(self.config.timeslots):
+                    if s + H <= len(self.config.timeslots):
                         s_var = self.start_vars[(idx, d, s)]
                         valid_starts.append(s_var)
-                        
-                        # If a course starts at (d, s), it occupies continuous `hours_needed`
-                        for k in range(hours_needed):
+                        for k in range(H):
                             self.model.AddImplication(s_var, self.assignments[(idx, d, s + k)])
 
-            # Constraint: A course part must have exactly one start time across the week
             self.model.AddExactlyOne(valid_starts)
 
         # 3. Split parts must be on different days
@@ -171,71 +109,59 @@ class OptiSchedSolver:
                     day_active_vars = []
                     for idx in indices:
                         day_active = self.model.NewBoolVar(f"course_{parent_id}_part_{idx}_day_{d}")
-                        # Link `day_active` variable to any scheduled slot on that day
                         self.model.Add(sum(self.assignments[(idx, d, s)] for s in self.config.timeslots) > 0).OnlyEnforceIf(day_active)
                         self.model.Add(sum(self.assignments[(idx, d, s)] for s in self.config.timeslots) == 0).OnlyEnforceIf(day_active.Not())
                         day_active_vars.append(day_active)
-                        
-                    # Constraint: Parts of the same course cannot occur on the same day
                     self.model.Add(sum(day_active_vars) <= 1)
 
-        # 4. Global Conflicts (Instructor)
+        # 4. Global Conflicts (Semester Logic / Instructor)
         for instructor in self.df['instructor'].unique():
-            if pd.isna(instructor) or str(instructor).strip() in ['-', ''] or str(instructor).strip().lower() == 'anonim':
-                continue
-                
+            if pd.isna(instructor) or str(instructor).strip() == '-' or str(instructor).strip().lower() == 'anonim': continue
             inst_group = self.df[self.df['instructor'] == instructor]
             for d in self.config.days:
                 for s in self.config.timeslots:
-                    # Constraint: An instructor teaches at most 1 course per timeslot
                     self.model.Add(sum(self.assignments[(idx, d, s)] for idx in inst_group.index) <= 1)
         
-        # 5. Global Conflicts (Semester Logic)
+        # Semester Conflict Logic
+        self.overlap_vars = []
         max_sec = self.df['section'].max() if not self.df.empty else 1
         
         for d in self.config.days:
             for s in self.config.timeslots:
-                for sem in range(1, 9):  # Academic semesters (Years 1 to 4 -> Semesters 1 to 8)
+                for sem in range(1, 9):
                     for sec_id in range(1, max_sec + 1):
-                        # Filter courses for current semester and specific section (or common section 1)
+                        # Aynı şube numarasına sahip dersler VEYA sadece tek şubesi olup herkese zorunlu olan dersler
                         group_same = self.df[
                             (self.df['semester'] == sem) & 
                             ((self.df['section'] == sec_id) | (self.df['total_sections'] == 1))
                         ].index.tolist()
                         
-                        # Filter for same logic but for +2 semesters (i.e. cross-years like Sem 1 and Sem 3)
                         group_next = self.df[
                             (self.df['semester'] == sem + 2) & 
                             ((self.df['section'] == sec_id) | (self.df['total_sections'] == 1))
                         ].index.tolist()
                         
-                        # Constraint: Courses in the same semester cohort cannot overlap
                         if group_same:
+                            # Aynı dönemin kendi içinde çakışması yasak (Hard constraint)
                             self.model.Add(sum(self.assignments[(idx, d, s)] for idx in group_same) <= 1)
-                        
-                        # Constraint: Same semester (N) and N+2 (e.g. Sem 1 and Sem 3) cohort cannot overlap
-                        if group_same or group_next:
-                            self.model.Add(sum(self.assignments[(idx, d, s)] for idx in group_same + group_next) <= 1)
+                        if group_same and group_next:
+                            # Alt-üst dönem çakışması (Soft constraint) - Mümkün mertebe kaçınılır
+                            overlap_var = self.model.NewBoolVar(f"overlap_sem{sem}_{sem+2}_d{d}_s{s}_sec{sec_id}")
+                            self.model.Add(sum(self.assignments[(idx, d, s)] for idx in group_same + group_next) <= 1).OnlyEnforceIf(overlap_var.Not())
+                            self.overlap_vars.append(overlap_var)
 
-        logger.info("Model built successfully.")
+        # Çakışmaları en aza indir (Minimize overlaps)
+        if self.overlap_vars:
+            self.model.Minimize(sum(self.overlap_vars))
 
-    def solve(self, output_excel_path: Path) -> None:
-        """
-        Invokes the CP-SAT solver and exports the generated schedule to an Excel file.
-        
-        Args:
-            output_excel_path (Path): Destination path for the resulting Excel file.
-        """
-        logger.info("Starting CP-SAT solver. Max time limit: %s seconds.", self.config.max_solve_time_seconds)
+    def solve(self, output_excel: str) -> None:
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = self.config.max_solve_time_seconds
-        solver.parameters.random_seed = self.config.random_seed
+        # Her çalıştırmada farklı sonuç üretmesi için rastgele seed
+        solver.parameters.random_seed = random.randint(1, 100000)
         
-        # Adding a solver callback could be useful here to log progress
         status = solver.Solve(self.model)
-        
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            logger.info("Solver found a viable schedule. Extracting results...")
             for idx, row in self.df.iterrows():
                 for d in self.config.days:
                     for s in self.config.timeslots:
@@ -250,36 +176,25 @@ class OptiSchedSolver:
                             })
             
             if not self.result_data:
-                logger.warning("Solution is optimal/feasible but no assignments were scheduled.")
+                print("✅ Çözüm bulundu ancak programlanacak atanmış ders yok.")
                 return
                 
-            self._export_to_excel(output_excel_path)
-            
-        else:
-            logger.error("Solver failed to find a feasible solution under the given constraints.")
-
-    def _export_to_excel(self, output_excel_path: Path) -> None:
-        """Internal helper to format and output the data grouping into Excel sheets."""
-        try:
             df_res = pd.DataFrame(self.result_data)
             
-            output_excel_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
-                # 1. Main flattened list view
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                # Liste görünümünde iç kullanım değişkenini düşür
                 df_list = df_res.drop(columns=['DersDetay', 'Dönem_Int']) if 'Dönem_Int' in df_res.columns else df_res
                 df_list.to_excel(writer, sheet_name='Liste_Gorunumu', index=False)
                 
-                # 2. Individual Sheets Per Day
-                for day_id in self.config.days:
-                    day_name = self.config.day_map[day_id]
+                # Tüm Dönemler için Günlere Özel 5 Sayfa
+                for d in self.config.days:
+                    day_name = self.config.day_map[d]
                     day_df = df_res[df_res['Gün'] == day_name]
                     
                     if day_df.empty:
                         pd.DataFrame().to_excel(writer, sheet_name=day_name)
                         continue
                         
-                    # Pivot table: Rows = Hours, Columns = Semesters
                     pivot_df = day_df.pivot_table(
                         index='Saat',
                         columns='Dönem',
@@ -287,102 +202,41 @@ class OptiSchedSolver:
                         aggfunc=lambda x: '\n\n'.join(x)
                     ).fillna('')
                     
-                    time_idx_order = [self.config.time_map[s] for s in self.config.timeslots]
-                    valid_rows = [r for r in time_idx_order if r in pivot_df.index]
+                    saat_sirasi = [self.config.time_map[s] for s in self.config.timeslots]
+                    valid_rows = [r for r in saat_sirasi if r in pivot_df.index]
+                    
                     unique_sems = sorted(day_df['Dönem_Int'].unique())
                     col_order = [f"{s}. Dönem" for s in unique_sems]
                     
                     pivot_df = pivot_df.reindex(index=valid_rows, columns=col_order).fillna('')
                     pivot_df.to_excel(writer, sheet_name=day_name)
-                    
-            logger.info("✅ Schedule successfully exported to '%s'.", output_excel_path)
-        except Exception as e:
-            logger.error("Failed to write to excel file: %s", e)
-            raise
+                
+            print(f"✅ Çizelge hazır: {output_excel}")
+        else:
+            print("❌ Çözüm bulunamadı!")
 
-
-def parse_arguments() -> argparse.Namespace:
-    """Parses command-line arguments for the application."""
-    parser = argparse.ArgumentParser(
-        description="OptiSched: Smart Academic Block Scheduler using CSP"
-    )
-    
-    parser.add_argument(
-        '--term', 
-        type=str, 
-        required=True,
-        choices=['guz', 'bahar', 'fall', 'spring'],
-        help="Target semester group to schedule (guz/fall for odd semesters, bahar/spring for even semesters)."
-    )
-    
-    parser.add_argument(
-        '--input', 
-        type=Path, 
-        default=Path('data/bil 2.xlsx'),
-        help="Path to the source Excel file containing course information."
-    )
-    
-    parser.add_argument(
-        '--output', 
-        type=Path, 
-        default=Path('output/'),
-        help="Path to the output directory where the final Excel file will be saved."
-    )
-    
-    return parser.parse_args()
-
-
-def main() -> None:
-    """Main execution function for the scheduler engine."""
-    args = parse_arguments()
-    
-    term_input = args.term.lower()
-    is_fall = term_input in ['guz', 'fall']
-    term_name = "Guz" if is_fall else "Bahar"
-    
-    input_path = args.input
-    if not input_path.exists():
-        logger.error("Input file not found at: %s. Reverting to default or aborting.", input_path)
+if __name__ == '__main__':
+    term_input = input("Hangi dönem grubunu planlamak istiyorsunuz? Güz (G) / Bahar (B): ").strip().upper()
+    if term_input not in ['G', 'B']:
+        print("Lütfen geçerli bir seçim yapınız: G (Güz) veya B (Bahar)!")
         sys.exit(1)
         
-    output_dir = args.output
-    output_file = output_dir / f"ders_programi_{term_name}.xlsx"
-
-    # Initialization
-    config = SchedulerConfig()
+    term_name = "Guz" if term_input == 'G' else "Bahar"
+        
+    conf = SchedulerConfig()
     loader = DataLoader()
+    course_df = loader.load_data('data/bil 2.xlsx')
     
-    try:
-        course_df = loader.load_data(input_path)
-    except Exception:
-        sys.exit(1)
-    
-    if course_df.empty:
-        logger.error("Failed or found no valid data from %s", input_path)
-        sys.exit(1)
-
-    # Filter semesters logic: Fall (Odd 1, 3, 5, 7), Spring (Even 2, 4, 6, 8)
-    initial_course_count = len(course_df)
-    if is_fall:
+    # Sadece seçili olan yarıyılları(Fall/Spring) filtrele
+    if term_input == 'G':
         course_df = course_df[course_df['semester'] % 2 != 0].reset_index(drop=True)
     else:
         course_df = course_df[course_df['semester'] % 2 == 0].reset_index(drop=True)
-        
-    filtered_course_count = len(course_df)
-    logger.info("Filtered for %s term: Reduced %d parts -> %d active schedule parts.", 
-                term_name.upper(), initial_course_count, filtered_course_count)
     
-    if course_df.empty:
-        logger.warning("No courses matched the criteria for term '%s'. Exiting.", term_name)
-        sys.exit(0)
-
-    # Initialize and Solve
-    scheduler = OptiSchedSolver(course_df, config)
+    print(f"Model oluşturuluyor... ({term_name} dönemi dersleri planlanıyor)")
+    scheduler = OptiSchedSolver(course_df, conf)
     scheduler.build_model()
     
-    logger.info("Solving... Result will be written to '%s'.", output_file)
-    scheduler.solve(output_excel_path=output_file)
-
-
-if __name__ == '__main__':
-    main()
+    out_file = f"output/ders_programi_{term_name}.xlsx"
+    print(f"Çözülüyor... Sonuç '{out_file}' dosyasına yazılacak.")
+    scheduler.solve(output_excel=out_file)
