@@ -16,8 +16,8 @@
 - **[EN] Block Scheduling:** Lectures and labs are automatically split (based on 2-2/3-2 rules) and scheduled sequentially.
 - **[TR] Çakışma Yönetimi:** Hoca, departman, dönem ve oda çakışmaları %100 engellenir.
 - **[EN] Conflict Management:** 100% prevention of lecturer, department, semester, and room conflicts.
-- **[TR] Excel Entegrasyonu:** Veriler doğrudan Excel'den (`2.xls`) okunur ve biçimlendirilmiş Excel raporları üretilir.
-- **[EN] Excel Integration:** Reads directly from Excel files and generates formatted Excel reports.
+- **[TR] Excel Entegrasyonu:** Veriler doğrudan `data/bil 2.xlsx` gibi Excel dosyalarından okunur ve biçimlendirilmiş Excel raporları üretilir.
+- **[EN] Excel Integration:** Reads directly from Excel files (e.g., `data/bil 2.xlsx`) and generates formatted Excel reports.
 
 ---
 
@@ -25,6 +25,6 @@
 
 1. Python 3.14+ kullanılması önerilir.
 2. Bağımlılıkları yükleyin: `pip install ortools pandas openpyxl xlrd`
-3. Çalıştırın: `python3 OptiSched/optisched_scheduler.py`
+3. Çalıştırın: `python optisched_scheduler.py --term guz` (veya bahar, fall, spring kullanabilirsiniz)
 
 

@@ -5,3 +5,4 @@ __pycache__/
 .vscode/
 ders_programi.xlsx
 *.log
+output/
